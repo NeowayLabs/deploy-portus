@@ -1,0 +1,614 @@
+#cloud-config
+
+hostname: registry
+
+coreos:
+  update:
+    reboot-strategy: off
+  units:
+    - name: systemd-sysctl.service
+      command: restart
+    - name: etcd.service
+      command: stop
+    - name: etcd2.service
+      mask: true
+    - name: fleet.service
+      command: stop
+    - name: locksmithd.service
+      mask: true
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 40-log-driver.conf
+          content: |
+            [Service]
+            Environment="DOCKER_OPTS=--log-driver=json-file --log-opt max-size=50M --log-opt max-file=1"
+    - name: environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Service to create environment file
+        After=docker.service
+        Requires=docker.service
+        Before=redis.service registry.service mysql.service portus.service
+        [Service]
+        Type=forking
+        User=root
+        Group=root
+        ExecStart=/opt/bin/environment.sh
+        [Install]
+        WantedBy=multi-user.target
+    - name: redis.service
+      command: start
+      content: |
+        [Unit]
+        Description=Redis is an open source (BSD licensed), in-memory data structure store
+        Documentation=http://redis.io/
+        After=docker.service environment.service
+        Requires=docker.service environment.service
+        Before=registry.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${REDIS_IMAGE}
+        ExecStart=/usr/bin/docker run --name %p \
+            --env-file /etc/profile.d/environment \
+            ${REDIS_IMAGE}
+        ExecStop=/usr/bin/docker stop %p
+        [Install]
+        WantedBy=multi-user.target
+    - name: mysql.service
+      command: start
+      content: |
+        [Unit]
+        After=docker.service environment.service
+        Requires=docker.service environment.service
+        Before=portus.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${MYSQL_IMAGE}
+        ExecStart=/usr/bin/docker run --name %p \
+            --env-file /etc/profile.d/environment \
+            --volume ${MYSQL_DATADIR_HOST_PATH}:${MYSQL_DATADIR_GUEST_PATH} \
+            ${MYSQL_IMAGE}
+        ExecStop=/usr/bin/docker stop %p
+    - name: portus-config.service
+      command: start
+      content: |
+        [Unit]
+        Description=Service to create portus config file
+        Before=portus.service
+        [Service]
+        Type=forking
+        User=root
+        Group=root
+        ExecStart=/opt/bin/portus-config.sh
+        [Install]
+        WantedBy=multi-user.target
+    - name: portus.service
+      command: start
+      content: |
+        [Unit]
+        After=docker.service environment.service mysql.service portus-config.service
+        Requires=docker.service environment.service mysql.service portus-config.service
+        Wants=portus-announce.service
+        Before=portus-announce.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${PORTUS_IMAGE}
+        ExecStartPre=-/usr/bin/docker run --rm --env-file /etc/profile.d/environment --link mysql:mysql ${PORTUS_IMAGE} rake db:create
+        ExecStartPre=-/usr/bin/docker run --rm --env-file /etc/profile.d/environment --link mysql:mysql ${PORTUS_IMAGE} rake db:migrate
+        ExecStartPre=-/usr/bin/docker run --rm --env-file /etc/profile.d/environment --link mysql:mysql ${PORTUS_IMAGE} rake db:seed
+        ExecStart=/usr/bin/docker run --name %p \
+            --publish 3000:3000 \
+            --env-file /etc/profile.d/environment \
+            --volume ${PORTUS_TMP_HOST_PATH}:${PORTUS_TMP_GUEST_PATH} \
+            --volume ${PORTUS_LOG_HOST_PATH}:${PORTUS_LOG_GUEST_PATH} \
+            --volume ${PORTUS_KEY_HOST_FILE}:${PORTUS_KEY_GUEST_FILE} \
+            --volume ${PORTUS_CFG_HOST_FILE}:${PORTUS_CFG_GUEST_FILE} \
+            --link mysql:mysql \
+            ${PORTUS_IMAGE} \
+            puma -e production -b tcp://0.0.0.0:3000 -w 5
+        ExecStop=/usr/bin/docker stop %p            
+    - name: crono.service
+      command: start
+      content: |
+        [Unit]
+        After=portus.service
+        Requires=portus.service mysql.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${PORTUS_IMAGE}
+        ExecStart=/usr/bin/docker run --name %p \
+            --env-file /etc/profile.d/environment \
+            --volume ${CRONO_LOG_HOST_PATH}:${CRONO_LOG_GUEST_PATH} \
+            --link mysql:mysql \
+            ${PORTUS_IMAGE} \
+            bundle exec crono
+        ExecStop=/usr/bin/docker stop %p            
+    - name: registry-config.service
+      command: start
+      content: |
+        [Unit]
+        Description=Service to create registry config file
+        Before=registry.service
+        [Service]
+        Type=forking
+        User=root
+        Group=root
+        ExecStart=/opt/bin/registry-config.sh
+        [Install]
+        WantedBy=multi-user.target
+    - name: registry.service
+      command: start
+      content: |
+        [Unit]
+        After=docker.service environment.service registry-config.service redis.service portus.service
+        Requires=docker.service environment.service registry-config.service redis.service portus.service
+        Wants=registry-announce.service
+        Before=registry-announce.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${REGISTRY_IMAGE}
+        ExecStart=/usr/bin/docker run --name %p \
+            --publish 5000:5000 \
+            --env-file /etc/profile.d/environment \
+            --link redis:redis \
+            --link portus:portus \
+            --volume ${REGISTRY_HOST_CFG_FILE}:${REGISTRY_GUEST_CFG_FILE} \
+            --volume ${REGISTRY_HOST_CRT_FILE}:${REGISTRY_GUEST_CRT_FILE} \
+            --volume ${REGISTRY_HOST_STORAGE_PATH}:${REGISTRY_GUEST_STORAGE_PATH} \
+            ${REGISTRY_IMAGE}
+        ExecStop=/usr/bin/docker stop %p            
+    - name: haproxy-config.service
+      command: start
+      content: |
+        [Unit]
+        Description=Service to create haproxy config file
+        Before=haproxy.service
+        [Service]
+        Type=forking
+        User=root
+        Group=root
+        ExecStart=/opt/bin/haproxy-config.sh
+        [Install]
+        WantedBy=multi-user.target
+    - name: haproxy.service
+      command: start
+      content: |
+        [Unit]
+        Description=A load balancer called HAProxy
+        Documentation=http://www.haproxy.org/
+        After=docker.service environment.service haproxy-config.service portus.service registry.service
+        Requires=docker.service environment.service haproxy-config.service portus.service registry.service
+        [Service]
+        EnvironmentFile=/etc/profile.d/environment
+        Restart=always
+        RestartSec=10
+        TimeoutSec=0
+        ExecStartPre=-/usr/bin/docker kill %p
+        ExecStartPre=-/usr/bin/docker rm %p
+        ExecStartPre=/usr/bin/docker pull ${HAPROXY_IMAGE}
+        ExecStart=/usr/bin/docker run --name %p \
+            --net=host \
+            --env-file /etc/profile.d/environment \
+            --volume ${HAPROXY_HOST_CFG_FILE}:${HAPROXY_GUEST_CFG_FILE} \
+            --volume ${HAPROXY_HOST_PEM_FILE}:${HAPROXY_GUEST_PEM_FILE} \
+            ${HAPROXY_IMAGE}
+        [Install]
+        WantedBy=multi-user.target
+        ExecStop=/usr/bin/docker stop %p
+write_files:
+  - path: /opt/bin/environment.sh
+    permissions: 755
+    content: |
+      #!/usr/bin/bash
+      OUTFILE=/etc/profile.d/environment
+      if [ ! -e "$OUTFILE" ]; then
+      MYSQL_ROOT_PASSWORD=$(awk -v a=$(uuidgen) 'BEGIN{gsub("-","",a);print a}' /dev/null)
+      MYSQL_PASSWORD=$(awk -v a=$(uuidgen) 'BEGIN{gsub("-","",a);print a}' /dev/null)
+      PORTUS_PASSWORD=$(awk -v a=$(uuidgen) 'BEGIN{gsub("-","",a);print a}' /dev/null)
+      mkdir -p /etc/profile.d
+      echo "
+      AWS_DEFAULT_REGION=us-west-2
+      S3_BUCKET=docker-registry
+      S3_PATH=mysql-backup
+      REDIS_IMAGE=redis:2
+      HAPROXY_HOST_CFG_FILE=/data/haproxy/haproxy.cfg
+      HAPROXY_GUEST_CFG_FILE=/usr/local/etc/haproxy/haproxy.cfg
+      HAPROXY_HOST_PEM_FILE=/data/haproxy/cert/registry.pem
+      HAPROXY_GUEST_PEM_FILE=/usr/local/etc/haproxy/registry.pem
+      HAPROXY_IMAGE=haproxy:1
+      REGISTRY_IMAGE=registry:2
+      REGISTRY_ELB_NAME=registry
+      REGISTRY_HOST_CFG_FILE=/data/registry/config.yml
+      REGISTRY_GUEST_CFG_FILE=/etc/docker/registry/config.yml
+      REGISTRY_HOST_CRT_FILE=/data/portus/certs/bundle/portus.crt
+      REGISTRY_GUEST_CRT_FILE=/registry/portus.crt
+      REGISTRY_HOST_STORAGE_PATH=/data/registry
+      REGISTRY_GUEST_STORAGE_PATH=/var/lib/docker-registry
+      MYSQL_IMAGE=mariadb:10
+      MYSQL_BACKUP_IMAGE=iainmckay/mysql-backup
+      MYSQL_DATADIR_HOST_PATH=/data/mysql
+      MYSQL_DATADIR_GUEST_PATH=/var/lib/mysql
+      MYSQL_USER=portus
+      MYSQL_DATABASE=portusdb
+      MYSQL_PASSWORD=$MYSQL_PASSWORD
+      MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+      RAILS_ENV=production
+      CATALOG_CRON=5.minutes
+      PORTUS_IMAGE=neowaylabs/portus
+      PORTUS_ELB_NAME=portus
+      PORTUS_PRODUCTION_HOST=mysql
+      PORTUS_PRODUCTION_USERNAME=portus
+      PORTUS_PRODUCTION_PASSWORD=$MYSQL_PASSWORD
+      PORTUS_PRODUCTION_DATABASE=portusdb
+      PORTUS_CHECK_SSL_USAGE_ENABLED=false
+      PORTUS_MACHINE_FQDN=www.your-registry.com.br
+      PORTUS_KEY_HOST_FILE=/data/portus/certs/bundle/portus.key
+      PORTUS_KEY_GUEST_FILE=/portus/portus.key
+      PORTUS_KEY_PATH=/portus/portus.key
+      PORTUS_PASSWORD=$PORTUS_PASSWORD
+      PORTUS_SIGNUP_ENABLED=false
+      PORTUS_SECRET_KEY_BASE=82d58d3dfb91238b495a311eb8539edf5064784f1d58994679db8363ec241c745bef0b446bfe44d66cbf91a2f4e497d8f6b1ef1656e3f405b0d263a9617ac75e
+      PORTUS_CFG_HOST_FILE=/data/portus/production.rb
+      PORTUS_CFG_GUEST_FILE=/portus/config/environments/production.rb
+      PORTUS_TMP_HOST_PATH=/data/portus/tmp
+      PORTUS_TMP_GUEST_PATH=/portus/tmp
+      PORTUS_LOG_HOST_PATH=/data/portus/log
+      PORTUS_LOG_GUEST_PATH=/portus/log
+      CRONO_LOG_HOST_PATH=/data/crono/log
+      CRONO_LOG_GUEST_PATH=/portus/log
+      PORTUS_EMAIL_FROM=your-registry@gmail.com
+      PORTUS_EMAIL_NAME=Portus
+      PORTUS_EMAIL_REPLY_TO=no-reply-your-registry@gmail.com
+      PORTUS_EMAIL_SMTP_ENABLED=true
+      PORTUS_EMAIL_SMTP_ADDRESS=smtp.gmail.com
+      PORTUS_EMAIL_SMTP_PORT=587
+      PORTUS_EMAIL_SMTP_USER_NAME=your-registry
+      PORTUS_EMAIL_SMTP_PASSWORD=your-registry-password
+      PORTUS_EMAIL_SMTP_DOMAIN=gmail.com
+      " > $OUTFILE
+      fi
+  - path: /opt/bin/registry-config.sh
+    permissions: 755
+    content: |
+      #!/usr/bin/bash
+      #
+      OUTFILE=/data/registry/config.yml
+      #
+      if [ ! -e "$OUTFILE" ]; then
+      mkdir -p /data/registry
+      echo "
+      version: 0.1
+      log:
+        level: info
+      storage:
+        filesystem:
+          rootdirectory: /var/lib/docker-registry
+        delete:
+          enabled: true
+        redirect:
+          disable: false
+        cache:
+          blobdescriptor: redis
+        maintenance:
+          uploadpurging:
+            enabled: true
+            age: 168h
+            interval: 24h
+            dryrun: false
+          readonly:
+            enabled: false
+      auth:
+        token:
+          realm: https://www.your-registry.com.br/v2/token
+          service: your-registry.neoway.com.br
+          issuer: www.your-registry.com.br
+          rootcertbundle: /registry/portus.crt
+      http:
+        addr: 0.0.0.0:5000
+      notifications:
+        endpoints:
+          - name: portus
+            disabled: false
+            url: https://www.your-registry.com.br/v2/webhooks/events
+            timeout: 500ms
+            threshold: 5
+            backoff: 1000
+      redis:
+        addr: redis:6379
+        dialtimeout: 10ms
+        readtimeout: 10ms
+        writetimeout: 10ms
+        pool:
+          maxidle: 16
+          maxactive: 64
+          idletimeout: 300s
+      " > $OUTFILE
+      fi
+  - path: "/opt/bin/portus-config.sh"
+    permissions: 755
+    content: |-
+      #!/usr/bin/bash
+      KEY_OUTFILE=/data/portus/certs/bundle/portus.key
+      CRT_OUTFILE=/data/portus/certs/bundle/portus.crt
+      if [ ! -e "$KEY_OUTFILE" ]; then
+      mkdir -p /data/portus/certs/bundle
+      openssl req \
+      -new \
+      -newkey rsa:4096 \
+      -days 365 \
+      -nodes \
+      -x509 \
+      -subj "/C=BR/ST=Santa Catarina/L=Florianopolis/O=Company/OU=Black Ops/CN=www.your-registry.com.br" \
+      -keyout $KEY_OUTFILE \
+      -out $CRT_OUTFILE
+      fi
+      OUTFILE=/data/portus/production.rb
+      if [ ! -e "$OUTFILE" ]; then
+      mkdir -p /data/portus
+      echo "
+      Rails.application.configure do
+        config.cache_classes = true
+        config.eager_load = true
+        config.consider_all_requests_local       = false
+        config.action_controller.perform_caching = true
+        config.serve_static_files = ENV[\"RAILS_SERVE_STATIC_FILES\"].present?
+        config.assets.js_compressor = :uglifier
+        config.assets.compile = true
+        config.assets.digest = true
+        config.log_level = :info
+        config.i18n.fallbacks = true
+        config.active_support.deprecation = :notify
+        config.action_mailer.delivery_method = :smtp
+        config.log_formatter = ::Logger::Formatter.new
+        config.active_record.dump_schema_after_migration = false
+        unless ENV[\"SKIP_MIGRATION\"]
+          config.after_initialize do
+            begin
+              ActiveRecord::Migrator.migrate(Rails.root.join(\"db/migrate\"), nil)
+            rescue
+              \$stderr.puts \"Error running migration! Please review database configuration\"
+            end
+          end
+        end
+      end
+      " > $OUTFILE
+      fi
+  - path: "/opt/bin/haproxy-config.sh"
+    permissions: 755
+    content: |-
+      #!/usr/bin/bash
+      #
+      PEM_OUTFILE=/data/haproxy/cert/registry.pem
+      #
+      if [ ! -e "PEM_OUTFILE" ]; then
+      mkdir -p /data/haproxy/cert
+      echo "
+      -----BEGIN PRIVATE KEY-----
+      k447sBG+Cvews+EWcndv1GZTvZ9VqMHU3D+D9FoHfAQOMLDFg/yair0s3c5e3CO0
+      ChFTsr8qTPwYGvYtA5kcRql6aKd1BXYtV1OuevlPC9GmjIWe04iD/azbVCw6/VVN
+      2BG6cF+RSom7qKY0/9sjIBPwPp6UhBY8URYYqLIeK3C9hZhDR2Q65AtcXNKm1D4Y
+      td3YI35unqhXmFGtSLSJTQ+4LZaG5ukyVDD/NoZGNBTJCX8IdmzRZ5hPLCk2vGLb
+      CcM/MjxtzisAx41gw2dTW305/E8o4O5p9J3yAfQfwj68z/yYAB5oLouZGyby0jy8
+      bkCnVsxjL2xB/9kDpUGR9EBRX2hbtlCIHcLn43wYis6vyF2CAHUzyDXddME5ykE7
+      4Uhne1Ay4lloQ20K36IAMAXcDwOQB0v/4hnL9FyGfs3ODEHEkNpAbbVadhSmvWYX
+      fg/roZ2fmjqpy9xD7mk3O3NA2JOkaadqmPRqP4OF+GzAlGVQ03g4YxX29/xmrzNK
+      HrXfvnRiCi8I5IXpGaOUpZFBVBwhUV1/zaaM/aMs3DNjH8Sw1DAWmKwwRHXsRVKT
+      0iJnLD7b8hOB6/Xh4xpySz+xAkv37Yktv354YnC9+OkOrdviXkWuVz5o32Ph0g0l
+      Pni9+ojRdWhqrOY5LvG0CjV0Pd8/FqfOvD1j3MPkXYOiHIBM5Y6FV4Ot153t1TfP
+      VIc43WX+zySBSfW0eGDEVdmDd6FNHMn6J8Vi2SyLqBKzeE1sif1BB/FvgCDh1APz
+      M9DVkGGqbLu7EapdBY1mt+wu1H/9E1AmGJejuzUzjJV6fRta18BEPNZ7I6ikoZN+
+      XNRHkRLcHefyTbDMgCIp2IXLLYaTCEzqbbkAZQiLadoRkEZEiUNRyatw7k+jp1rQ
+      ZJCdwgr+OxYbn45g1ZlzqSQBrWBItjIB4MWy9AXBX3gdjGNXDYg9aIKbtYnCOcAY
+      p02fHdQNDbSGMc8MeqRuuo96jI9BUZzicptas44Im2G57D9pm+ttLdM3gcWifH60
+      ZVa81xrFFVGTfuc4Liu/d7TqD/4ZTrEdXjbM4tJhVkYPrV2EKoWM1LyUpXiNsUhm
+      YVIG7IY29F40VGYb10Crh+/hE9swA0TX86dePOMN/Qar2YT+/9nTb+a8zsGs9U1h
+      0cTymdvul+b0zYjieHFKE7av37tZK7azxqQt5KTQwMm3T1nEtX355xb2YgAPIEsE
+      h4coLejpKnpodx7hljJ2ysVIoHoyqoNMXJUN+4xtEIUjuc66k5oRFyjSm13EAX/u
+      5AG4ZEvCZFmxv+nwWFlby7nanVIaML2XKYFyYL+lIfcanSsuIaL911Wi4xR5tmZ2
+      iMWLyfDQ1RES1kuohz4askWaepZaJWoiRa49S+TwxaNw2mWC4hr7llcP0nDxLv2d
+      74+QEXG9uR/aeQKi/Cbvo6AVS4lFiv40g4vto9P2R0YagQcjX2sDHJTQAzdIyFht
+      meV372XH7BE6M/CxLqvqObnZ0gOv4gpm8KiMlcDtuBjxRl13DdXCC8HnBHKzdzvD
+      K1BWWEyaVnhKYrQs+FoAqngDWWIcEug+PfZvQdoGa91zB/GSUBeR3A==
+      -----END PRIVATE KEY-----
+      -----BEGIN CERTIFICATE-----
+      k447sBG+Cvews+EWcndv1GZTvZ9VqMHU3D+D9FoHfAQOMLDFg/yair0s3c5e3CO0
+      ChFTsr8qTPwYGvYtA5kcRql6aKd1BXYtV1OuevlPC9GmjIWe04iD/azbVCw6/VVN
+      2BG6cF+RSom7qKY0/9sjIBPwPp6UhBY8URYYqLIeK3C9hZhDR2Q65AtcXNKm1D4Y
+      td3YI35unqhXmFGtSLSJTQ+4LZaG5ukyVDD/NoZGNBTJCX8IdmzRZ5hPLCk2vGLb
+      CcM/MjxtzisAx41gw2dTW305/E8o4O5p9J3yAfQfwj68z/yYAB5oLouZGyby0jy8
+      bkCnVsxjL2xB/9kDpUGR9EBRX2hbtlCIHcLn43wYis6vyF2CAHUzyDXddME5ykE7
+      4Uhne1Ay4lloQ20K36IAMAXcDwOQB0v/4hnL9FyGfs3ODEHEkNpAbbVadhSmvWYX
+      fg/roZ2fmjqpy9xD7mk3O3NA2JOkaadqmPRqP4OF+GzAlGVQ03g4YxX29/xmrzNK
+      HrXfvnRiCi8I5IXpGaOUpZFBVBwhUV1/zaaM/aMs3DNjH8Sw1DAWmKwwRHXsRVKT
+      0iJnLD7b8hOB6/Xh4xpySz+xAkv37Yktv354YnC9+OkOrdviXkWuVz5o32Ph0g0l
+      Pni9+ojRdWhqrOY5LvG0CjV0Pd8/FqfOvD1j3MPkXYOiHIBM5Y6FV4Ot153t1TfP
+      VIc43WX+zySBSfW0eGDEVdmDd6FNHMn6J8Vi2SyLqBKzeE1sif1BB/FvgCDh1APz
+      M9DVkGGqbLu7EapdBY1mt+wu1H/9E1AmGJejuzUzjJV6fRta18BEPNZ7I6ikoZN+
+      XNRHkRLcHefyTbDMgCIp2IXLLYaTCEzqbbkAZQiLadoRkEZEiUNRyatw7k+jp1rQ
+      ZJCdwgr+OxYbn45g1ZlzqSQBrWBItjIB4MWy9AXBX3gdjGNXDYg9aIKbtYnCOcAY
+      p02fHdQNDbSGMc8MeqRuuo96jI9BUZzicptas44Im2G57D9pm+ttLdM3gcWifH60
+      ZVa81xrFFVGTfuc4Liu/d7TqD/4ZTrEdXjbM4tJhVkYPrV2EKoWM1LyUpXiNsUhm
+      YVIG7IY29F40VGYb10Crh+/hE9swA0TX86dePOMN/Qar2YT+/9nTb+a8zsGs9U1h
+      0cTymdvul+b0zYjieHFKE7av37tZK7azxqQt5KTQwMm3T1nEtX355xb2YgAPIEsE
+      h4coLejpKnpodx7hljJ2ysVIoHoyqoNMXJUN+4xtEIUjuc66k5oRFyjSm13EAX/u
+      5AG4ZEvCZFmxv+nwWFlby7nanVIaML2XKYFyYL+lIfcanSsuIaL911Wi4xR5tmZ2
+      iMWLyfDQ1RES1kuohz4askWaepZaJWoiRa49S+TwxaNw2mWC4hr7llcP0nDxLv2d
+      74+QEXG9uR/aeQKi/Cbvo6AVS4lFiv40g4vto9P2R0YagQcjX2sDHJTQAzdIyFht
+      meV372XH7BE6M/CxLqvqObnZ0gOv4gpm8KiMlcDtuBjxRl13DdXCC8HnBHKzdzvD
+      K1BWWEyaVnhKYrQs+FoAqngDWWIcEug+PfZvQdoGa91zB/GSUBeR3A==
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      k447sBG+Cvews+EWcndv1GZTvZ9VqMHU3D+D9FoHfAQOMLDFg/yair0s3c5e3CO0
+      ChFTsr8qTPwYGvYtA5kcRql6aKd1BXYtV1OuevlPC9GmjIWe04iD/azbVCw6/VVN
+      2BG6cF+RSom7qKY0/9sjIBPwPp6UhBY8URYYqLIeK3C9hZhDR2Q65AtcXNKm1D4Y
+      td3YI35unqhXmFGtSLSJTQ+4LZaG5ukyVDD/NoZGNBTJCX8IdmzRZ5hPLCk2vGLb
+      CcM/MjxtzisAx41gw2dTW305/E8o4O5p9J3yAfQfwj68z/yYAB5oLouZGyby0jy8
+      bkCnVsxjL2xB/9kDpUGR9EBRX2hbtlCIHcLn43wYis6vyF2CAHUzyDXddME5ykE7
+      4Uhne1Ay4lloQ20K36IAMAXcDwOQB0v/4hnL9FyGfs3ODEHEkNpAbbVadhSmvWYX
+      fg/roZ2fmjqpy9xD7mk3O3NA2JOkaadqmPRqP4OF+GzAlGVQ03g4YxX29/xmrzNK
+      HrXfvnRiCi8I5IXpGaOUpZFBVBwhUV1/zaaM/aMs3DNjH8Sw1DAWmKwwRHXsRVKT
+      0iJnLD7b8hOB6/Xh4xpySz+xAkv37Yktv354YnC9+OkOrdviXkWuVz5o32Ph0g0l
+      Pni9+ojRdWhqrOY5LvG0CjV0Pd8/FqfOvD1j3MPkXYOiHIBM5Y6FV4Ot153t1TfP
+      VIc43WX+zySBSfW0eGDEVdmDd6FNHMn6J8Vi2SyLqBKzeE1sif1BB/FvgCDh1APz
+      M9DVkGGqbLu7EapdBY1mt+wu1H/9E1AmGJejuzUzjJV6fRta18BEPNZ7I6ikoZN+
+      XNRHkRLcHefyTbDMgCIp2IXLLYaTCEzqbbkAZQiLadoRkEZEiUNRyatw7k+jp1rQ
+      ZJCdwgr+OxYbn45g1ZlzqSQBrWBItjIB4MWy9AXBX3gdjGNXDYg9aIKbtYnCOcAY
+      p02fHdQNDbSGMc8MeqRuuo96jI9BUZzicptas44Im2G57D9pm+ttLdM3gcWifH60
+      ZVa81xrFFVGTfuc4Liu/d7TqD/4ZTrEdXjbM4tJhVkYPrV2EKoWM1LyUpXiNsUhm
+      YVIG7IY29F40VGYb10Crh+/hE9swA0TX86dePOMN/Qar2YT+/9nTb+a8zsGs9U1h
+      0cTymdvul+b0zYjieHFKE7av37tZK7azxqQt5KTQwMm3T1nEtX355xb2YgAPIEsE
+      h4coLejpKnpodx7hljJ2ysVIoHoyqoNMXJUN+4xtEIUjuc66k5oRFyjSm13EAX/u
+      5AG4ZEvCZFmxv+nwWFlby7nanVIaML2XKYFyYL+lIfcanSsuIaL911Wi4xR5tmZ2
+      iMWLyfDQ1RES1kuohz4askWaepZaJWoiRa49S+TwxaNw2mWC4hr7llcP0nDxLv2d
+      74+QEXG9uR/aeQKi/Cbvo6AVS4lFiv40g4vto9P2R0YagQcjX2sDHJTQAzdIyFht
+      meV372XH7BE6M/CxLqvqObnZ0gOv4gpm8KiMlcDtuBjxRl13DdXCC8HnBHKzdzvD
+      K1BWWEyaVnhKYrQs+FoAqngDWWIcEug+PfZvQdoGa91zB/GSUBeR3A==
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      k447sBG+Cvews+EWcndv1GZTvZ9VqMHU3D+D9FoHfAQOMLDFg/yair0s3c5e3CO0
+      ChFTsr8qTPwYGvYtA5kcRql6aKd1BXYtV1OuevlPC9GmjIWe04iD/azbVCw6/VVN
+      2BG6cF+RSom7qKY0/9sjIBPwPp6UhBY8URYYqLIeK3C9hZhDR2Q65AtcXNKm1D4Y
+      td3YI35unqhXmFGtSLSJTQ+4LZaG5ukyVDD/NoZGNBTJCX8IdmzRZ5hPLCk2vGLb
+      CcM/MjxtzisAx41gw2dTW305/E8o4O5p9J3yAfQfwj68z/yYAB5oLouZGyby0jy8
+      bkCnVsxjL2xB/9kDpUGR9EBRX2hbtlCIHcLn43wYis6vyF2CAHUzyDXddME5ykE7
+      4Uhne1Ay4lloQ20K36IAMAXcDwOQB0v/4hnL9FyGfs3ODEHEkNpAbbVadhSmvWYX
+      fg/roZ2fmjqpy9xD7mk3O3NA2JOkaadqmPRqP4OF+GzAlGVQ03g4YxX29/xmrzNK
+      HrXfvnRiCi8I5IXpGaOUpZFBVBwhUV1/zaaM/aMs3DNjH8Sw1DAWmKwwRHXsRVKT
+      0iJnLD7b8hOB6/Xh4xpySz+xAkv37Yktv354YnC9+OkOrdviXkWuVz5o32Ph0g0l
+      Pni9+ojRdWhqrOY5LvG0CjV0Pd8/FqfOvD1j3MPkXYOiHIBM5Y6FV4Ot153t1TfP
+      VIc43WX+zySBSfW0eGDEVdmDd6FNHMn6J8Vi2SyLqBKzeE1sif1BB/FvgCDh1APz
+      M9DVkGGqbLu7EapdBY1mt+wu1H/9E1AmGJejuzUzjJV6fRta18BEPNZ7I6ikoZN+
+      XNRHkRLcHefyTbDMgCIp2IXLLYaTCEzqbbkAZQiLadoRkEZEiUNRyatw7k+jp1rQ
+      ZJCdwgr+OxYbn45g1ZlzqSQBrWBItjIB4MWy9AXBX3gdjGNXDYg9aIKbtYnCOcAY
+      p02fHdQNDbSGMc8MeqRuuo96jI9BUZzicptas44Im2G57D9pm+ttLdM3gcWifH60
+      ZVa81xrFFVGTfuc4Liu/d7TqD/4ZTrEdXjbM4tJhVkYPrV2EKoWM1LyUpXiNsUhm
+      YVIG7IY29F40VGYb10Crh+/hE9swA0TX86dePOMN/Qar2YT+/9nTb+a8zsGs9U1h
+      0cTymdvul+b0zYjieHFKE7av37tZK7azxqQt5KTQwMm3T1nEtX355xb2YgAPIEsE
+      h4coLejpKnpodx7hljJ2ysVIoHoyqoNMXJUN+4xtEIUjuc66k5oRFyjSm13EAX/u
+      5AG4ZEvCZFmxv+nwWFlby7nanVIaML2XKYFyYL+lIfcanSsuIaL911Wi4xR5tmZ2
+      iMWLyfDQ1RES1kuohz4askWaepZaJWoiRa49S+TwxaNw2mWC4hr7llcP0nDxLv2d
+      74+QEXG9uR/aeQKi/Cbvo6AVS4lFiv40g4vto9P2R0YagQcjX2sDHJTQAzdIyFht
+      meV372XH7BE6M/CxLqvqObnZ0gOv4gpm8KiMlcDtuBjxRl13DdXCC8HnBHKzdzvD
+      K1BWWEyaVnhKYrQs+FoAqngDWWIcEug+PfZvQdoGa91zB/GSUBeR3A==
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      k447sBG+Cvews+EWcndv1GZTvZ9VqMHU3D+D9FoHfAQOMLDFg/yair0s3c5e3CO0
+      ChFTsr8qTPwYGvYtA5kcRql6aKd1BXYtV1OuevlPC9GmjIWe04iD/azbVCw6/VVN
+      2BG6cF+RSom7qKY0/9sjIBPwPp6UhBY8URYYqLIeK3C9hZhDR2Q65AtcXNKm1D4Y
+      td3YI35unqhXmFGtSLSJTQ+4LZaG5ukyVDD/NoZGNBTJCX8IdmzRZ5hPLCk2vGLb
+      CcM/MjxtzisAx41gw2dTW305/E8o4O5p9J3yAfQfwj68z/yYAB5oLouZGyby0jy8
+      bkCnVsxjL2xB/9kDpUGR9EBRX2hbtlCIHcLn43wYis6vyF2CAHUzyDXddME5ykE7
+      4Uhne1Ay4lloQ20K36IAMAXcDwOQB0v/4hnL9FyGfs3ODEHEkNpAbbVadhSmvWYX
+      fg/roZ2fmjqpy9xD7mk3O3NA2JOkaadqmPRqP4OF+GzAlGVQ03g4YxX29/xmrzNK
+      HrXfvnRiCi8I5IXpGaOUpZFBVBwhUV1/zaaM/aMs3DNjH8Sw1DAWmKwwRHXsRVKT
+      0iJnLD7b8hOB6/Xh4xpySz+xAkv37Yktv354YnC9+OkOrdviXkWuVz5o32Ph0g0l
+      Pni9+ojRdWhqrOY5LvG0CjV0Pd8/FqfOvD1j3MPkXYOiHIBM5Y6FV4Ot153t1TfP
+      VIc43WX+zySBSfW0eGDEVdmDd6FNHMn6J8Vi2SyLqBKzeE1sif1BB/FvgCDh1APz
+      M9DVkGGqbLu7EapdBY1mt+wu1H/9E1AmGJejuzUzjJV6fRta18BEPNZ7I6ikoZN+
+      XNRHkRLcHefyTbDMgCIp2IXLLYaTCEzqbbkAZQiLadoRkEZEiUNRyatw7k+jp1rQ
+      ZJCdwgr+OxYbn45g1ZlzqSQBrWBItjIB4MWy9AXBX3gdjGNXDYg9aIKbtYnCOcAY
+      p02fHdQNDbSGMc8MeqRuuo96jI9BUZzicptas44Im2G57D9pm+ttLdM3gcWifH60
+      ZVa81xrFFVGTfuc4Liu/d7TqD/4ZTrEdXjbM4tJhVkYPrV2EKoWM1LyUpXiNsUhm
+      YVIG7IY29F40VGYb10Crh+/hE9swA0TX86dePOMN/Qar2YT+/9nTb+a8zsGs9U1h
+      0cTymdvul+b0zYjieHFKE7av37tZK7azxqQt5KTQwMm3T1nEtX355xb2YgAPIEsE
+      h4coLejpKnpodx7hljJ2ysVIoHoyqoNMXJUN+4xtEIUjuc66k5oRFyjSm13EAX/u
+      5AG4ZEvCZFmxv+nwWFlby7nanVIaML2XKYFyYL+lIfcanSsuIaL911Wi4xR5tmZ2
+      iMWLyfDQ1RES1kuohz4askWaepZaJWoiRa49S+TwxaNw2mWC4hr7llcP0nDxLv2d
+      74+QEXG9uR/aeQKi/Cbvo6AVS4lFiv40g4vto9P2R0YagQcjX2sDHJTQAzdIyFht
+      meV372XH7BE6M/CxLqvqObnZ0gOv4gpm8KiMlcDtuBjxRl13DdXCC8HnBHKzdzvD
+      K1BWWEyaVnhKYrQs+FoAqngDWWIcEug+PfZvQdoGa91zB/GSUBeR3A==
+      -----END CERTIFICATE-----
+      " > $PEM_OUTFILE
+      fi
+      #
+      OUTFILE=/data/haproxy/haproxy.cfg
+      #
+      if [ ! -e "$OUTFILE" ]; then
+      mkdir -p /data/haproxy
+      echo "
+          # config for haproxy 1.6.x
+          
+          global
+              log 127.0.0.1   local0
+              log 127.0.0.1   local1 notice
+              maxconn 4096
+              tune.ssl.default-dh-param 2048
+              user root 
+              group root
+          
+          defaults
+              balance                 roundrobin
+              mode                    http
+              log                     global
+              option                  httplog
+              option                  dontlognull
+              option http-server-close
+              option forwardfor       except 127.0.0.0/8
+              option                  redispatch
+              retries                 3
+              timeout http-request    30s
+              timeout queue           1m
+              timeout connect         30s
+              timeout client          1m
+              timeout server          1m
+              timeout http-keep-alive 30s
+              timeout check           30s
+              maxconn                 30000
+
+          frontend http-in
+              bind *:80
+              redirect scheme https if !{ ssl_fc }
+              
+          frontend https-in
+              bind *:443 ssl crt /usr/local/etc/haproxy/registry.pem
+              
+              # Define hosts
+              acl host_portus hdr(host) -i www.your-registry.com.br
+              acl host_registry hdr(host) -i your-registry.com.br
+
+              # Send Host for Docker client
+              reqadd X-Forwarded-Proto:\ https
+
+              ## figure out which one to use
+              use_backend portus if host_portus
+              use_backend registry if host_registry
+          
+          backend portus
+              option httpclose
+              option forwardfor
+              server node1 0.0.0.0:3000
+          
+          
+          backend registry
+              option httpclose
+              option forwardfor
+              server node1 0.0.0.0:5000
+      " > $OUTFILE      
+      fi
